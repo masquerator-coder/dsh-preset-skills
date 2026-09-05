@@ -70,6 +70,8 @@ cp lib/index.js lib/index.js.map lib/index.d.ts cordis.patch.yml \
 
 旧机制已移除：三预设（research/teacher/developer）的 `agent.cordis.yml` 不再含 `preset-skills`/`./preset-skills/index.mjs` 行（grep 计数 0），其 `preset-skills/` 目录已不存在；新机制独立成立。
 
+**v4.2 动态切预设真机验证（dsh web，2026-09-05）**：新建 research 会话（marker：`sync source=created … to=research … registered=20`）→ 空白态切 teacher → 发 hi，marker：`sync build=v4.2 … source=selected from=research to=teacher … disposed=20 registered=5`；模型可见 `<available_skills>` = teacher 5 项 + 全局，research 泄漏为空。对比 v4.1 同场景（遗留旧预设、新预设缺失）已修复。
+
 ## 已知边界
 
 - **动态切预设（v4.2 已支持，限空白会话）**：dsh 只允许在从未跑过模型回合的空白会话里切预设（`turnBoundary` 守卫）。切换后插件立即把该会话的注册收敛到新预设（释放旧集、应用新集）。已开始过对话的会话其预设被 dsh 锁定，无需也无法切换。若未来 dsh 允许会话中途换预设，需要新的收敛语义（含历史一致性设计）。

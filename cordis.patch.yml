@@ -1,0 +1,20 @@
+# dsh-preset-skills — bundle patch
+#
+# Applied automatically when installed as a profile bundle: the loader resolves
+# `name: dsh-preset-skills` against the profile's dependency graph, then calls
+# the package's `apply(ctx, config)`. This row MUST sit on the host plane
+# (unscoped): it observes `agent/created` (agent already composed its preset by
+# then) and registers skills through the agent's own scoped `skills` service,
+# so each registration lands in that agent's preset-isolated scope layer.
+
+- insert:
+    - id: preset-skills
+      name: dsh-preset-skills
+      config:
+        # Optional: override the DSH_HOME (defaults to $DSH_HOME or ~/.dsh).
+        # dshHome: C:/Users/fuqia/.dsh
+        # Marker log path; default <DSH_HOME>/dsh-preset-skills.log
+        # logFile: C:/Users/fuqia/.dsh/dsh-preset-skills.log
+        # Append candidate-event probes to the marker log (diagnostic noise).
+        # Set true only while investigating which lifecycle events fire.
+        debug: false

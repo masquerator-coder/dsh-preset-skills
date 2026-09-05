@@ -1,7 +1,7 @@
 {
   "name": "dsh-preset-skills",
-  "version": "4.0.0",
-  "description": "Register each agent preset's own skills/ directory as discoverable, preset-isolated skills in DeepSeek Harness. Replacement for the old preset-skills copy-in mechanism.",
+  "version": "4.2.0",
+  "description": "Register each agent preset's own skills/ directory as discoverable, preset-isolated skills in DeepSeek Harness, including blank-session preset switching. Replacement for the old preset-skills copy-in mechanism.",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",

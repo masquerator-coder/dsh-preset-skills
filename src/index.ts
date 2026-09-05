@@ -2,8 +2,7 @@
  * dsh-preset-skills — register each agent preset's own `skills/` directory as
  * discoverable, strictly preset-isolated skills.
  *
- * v4 mechanism (bundle-based, out-of-tree; replaces the old per-preset
- * copy-in rows in `agent.cordis.yml`):
+ * v4 bundle mechanism (out-of-tree; replaces the old per-preset copy-in rows):
  *
  *   - Host-plane plugin row (profile bundle, unscoped). It observes
  *     `agent/created`, which the agent factory emits AFTER the agent's preset
@@ -31,13 +30,30 @@
  *     both user-root presets (`~/.dsh/.agent-presets/<id>/skills`) and
  *     shipped-root presets that carry one (e.g. `cordis`).
  *
- * All services are resolved lazily INSIDE the event handler (never cached at
+ * v4.2 — dynamic preset switching on a BLANK session:
+ *
+ *   dsh allows switching an agent to another preset while its session is blank
+ *   (`agent-presets select → swap`: guarded by turnBoundary, then
+ *   `recompose()` re-links the agent scope to the new standing key, and only
+ *   after the commit appends `agent-preset/selected` to the session). That
+ *   recompose does NOT re-announce `agent/created`, so v4.1 left the previous
+ *   preset's skills in the agentKey layer and never registered the new
+ *   preset's. v4.2 listens for `agent-preset/selected` (sessionId, preset),
+ *   resolves the live agent, and CONVERGES that agent's registration:
+ *   prepare the new preset's skills read-only first, then dispose the
+ *   previous set's disposers, then apply the new set. All per-agent work runs
+ *   through one serialized queue, so a switch racing an in-flight
+ *   `agent/created` registration cannot interleave. Disposing the old set
+ *   mirrors dsh's own recompose semantics (re-link = swap of the resolved
+ *   view); the blank-session guard means no model turn observes the window.
+ *
+ * All services are resolved lazily INSIDE the event handlers (never cached at
  * `apply` time), so composition order cannot strand the plugin with a stale
  * `undefined` service handle.
  *
  * Marker log (`<DSH_HOME>/dsh-preset-skills.log`, append-only) is the
- * deterministic evidence channel: every event, resolution, and registration
- * attempt is recorded there regardless of logger level.
+ * deterministic evidence channel: every event, resolution, registration, and
+ * switch is recorded there regardless of logger level.
  *
  * @module dsh-preset-skills
  */
@@ -47,17 +63,27 @@ import { appendFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 import { discoverSkills, loadSkill } from './parse.ts'
-import { registerPresetSkills, toRegistration, type RegisterSeam } from './register.ts'
+import {
+  applyPresetDefinitions,
+  preparePresetSkills,
+  toRegistration,
+  type RegisterSeam,
+  type SkillRegistration,
+} from './register.ts'
 import type { AgentLike, AgentPresetsLike, SkillsLike } from './types.ts'
 
 export { discoverSkills, loadSkill, parseSkillSource, isSkillName } from './parse.ts'
-export { registerPresetSkills, toRegistration } from './register.ts'
-export type { RegisterSeam, PresetRegisterResult, SkillRegistration } from './register.ts'
+export {
+  applyPresetDefinitions,
+  preparePresetSkills,
+  toRegistration,
+} from './register.ts'
+export type { RegisterSeam, PreparedPreset, ApplyResult, SkillRegistration } from './register.ts'
 
 export const name = 'dsh-preset-skills'
 
 /** Build stamp included in marker lines so experiments identify the running code. */
-const BUILD = 'v4.1'
+const BUILD = 'v4.2'
 
 /** Config accepted by the binder. */
 export interface Config {
@@ -67,6 +93,12 @@ export interface Config {
   logFile?: string
   /** Append candidate-event probes to the marker log (diagnostic noise). */
   debug?: boolean
+}
+
+/** One applied registration set for a live agent (WeakMap value; GC with agent). */
+interface RegistrationRecord {
+  readonly presetId: string
+  readonly disposers: readonly (() => void)[]
 }
 
 /** Resolve DSH_HOME the same way `@deepseek-ai/dsh-home-paths` does. */
@@ -104,12 +136,80 @@ export function apply(ctx: Context, config: Config = {}): void {
     ;(ctx as unknown as { on(name: string, listener: (...args: any[]) => void): unknown }).on(name, listener)
   }
 
+  /** Per-agent serialized work: a switch racing a create cannot interleave. */
+  const queues = new Map<string, Promise<void>>()
+  const current = new WeakMap<object, RegistrationRecord>()
+
+  const enqueue = (agentId: string, task: () => Promise<void>): void => {
+    const prev = queues.get(agentId) ?? Promise.resolve()
+    const guard = prev.then(task, task).catch(() => undefined)
+    queues.set(agentId, guard)
+    void guard.then(() => {
+      if (queues.get(agentId) === guard) queues.delete(agentId)
+    })
+  }
+
   // ---------------------------------------------------------------------------
-  // MAIN HOOK: agent/created. The preset is already composed at this point.
+  // MAIN HOOK: agent/created. Preset already composed; register its skills and
+  // record the applied set so a later blank-session switch can converge it.
   // Body is fully async-contained: a synchronous throw would veto publication.
   // ---------------------------------------------------------------------------
   on('agent/created', ({ agent }: { agent: unknown }) => {
-    void handleAgentCreated(ctx, agent, { log, getService })
+    const a = agent as AgentLike
+    try {
+      const delegated = sessionDelegationDepth(agent)
+      if (delegated > 0) {
+        log(`[preset-skills] agent/created build=${BUILD} agent=${String(a.id ?? '?')} DELEGATED depth=${delegated} (skip)`)
+        return
+      }
+      enqueue(String(a.id ?? '?'), () => syncPreset({
+        agent: agent as AgentView,
+        source: 'created',
+        desired: resolveComposedPreset(ctx, agent, log),
+        log,
+        getService,
+        current,
+      }))
+    } catch (error) {
+      log(`[preset-skills] ERROR enqueue agent/created agent=${String(a.id ?? '?')}: ${String(error)}`)
+    }
+  })
+
+  // ---------------------------------------------------------------------------
+  // v4.2: dynamic preset switch on a live (blank) session. agent-presets emits
+  // this AFTER recompose committed AND the session appended agent-preset/selected
+  // (agent-presets/src/index.ts swap: recompose → append → session/event → emit).
+  // Converge the agent's registrations: dispose previous set, apply the new.
+  // ---------------------------------------------------------------------------
+  on('agent-preset/selected', (sessionId: unknown, agentPreset: unknown) => {
+    const sid = typeof sessionId === 'string' ? sessionId : String(sessionId ?? '?')
+    const preset = typeof agentPreset === 'string' ? agentPreset : undefined
+    try {
+      if (preset === undefined) {
+        log(`[preset-skills] preset/selected build=${BUILD} agent=${sid} INVALID preset payload`)
+        return
+      }
+      const agents = getService<{ get(id: string): unknown }>('agents')
+      const agent = agents?.get(sid) as AgentView | undefined
+      if (agent === undefined || !isAgentLike(agent)) {
+        log(`[preset-skills] preset/selected build=${BUILD} agent=${sid} to=${preset} no-live-agent (skip)`)
+        return
+      }
+      if (sessionDelegationDepth(agent) > 0) {
+        log(`[preset-skills] preset/selected build=${BUILD} agent=${sid} to=${preset} DELEGATED (skip)`)
+        return
+      }
+      enqueue(sid, () => syncPreset({
+        agent,
+        source: 'selected',
+        desired: preset,
+        log,
+        getService,
+        current,
+      }))
+    } catch (error) {
+      log(`[preset-skills] ERROR preset/selected agent=${sid}: ${String(error)}`)
+    }
   })
 
   // ---------------------------------------------------------------------------
@@ -123,8 +223,6 @@ export function apply(ctx: Context, config: Config = {}): void {
       log(`[preset-skills:ev] agent/session-start agent=${idOfAgent(agent)}`)
     })
     on('session/event', (session: unknown, event: { type?: string }) => {
-      // Firehose is chatty: record only the first event type per session and
-      // every preset switch (the recompose signal).
       const sid = idOfSession(session)
       const type = typeof event?.type === 'string' ? event.type : '?'
       if (type === 'agent-preset/selected') {
@@ -137,86 +235,138 @@ export function apply(ctx: Context, config: Config = {}): void {
       if (seenEventTypes.size > 4096) seenEventTypes.clear()
       log(`[preset-skills:ev] session/event session=${sid} first=${type}`)
     })
-    on('agent-preset/selected', (sessionId: unknown, agentPreset: unknown) => {
-      log(`[preset-skills:ev] agent-preset/selected session=${String(sessionId)} preset=${String(agentPreset)}`)
-    })
   }
 }
 
 /** Debug probe dedupe key (first event type per session). */
 const seenEventTypes = new Set<string>()
 
-/** Handle one `agent/created`: resolve preset, discover, register. Never throws. */
-async function handleAgentCreated(
-  ctx: Context,
-  agent: unknown,
-  deps: { log: (line: string) => void; getService: <T>(name: string) => T | undefined },
-): Promise<void> {
-  const { log, getService } = deps
-  const a = agent as AgentLike
-  const id = String(a.id ?? '?')
-  try {
-    const agentPresets = getService<AgentPresetsLike>('agentPresets')
-    const delegated = sessionDelegationDepth(agent)
-    if (delegated > 0) {
-      log(`[preset-skills] agent/created build=${BUILD} agent=${id} DELEGATED depth=${delegated} (skip)`)
-      return
-    }
+/** Minimal structural agent surface used by the sync path. */
+interface AgentView {
+  readonly id?: unknown
+  readonly ctx: unknown
+  readonly session?: unknown
+}
 
-    let presetId: string | undefined
-    let presetSource = 'none'
+interface SyncDeps {
+  log: (line: string) => void
+  getService: <T>(name: string) => T | undefined
+  current: WeakMap<object, RegistrationRecord>
+}
+
+/**
+ * Converge one agent's registrations onto `desired` preset: prepare read-only,
+ * then dispose the previous applied set (if any) and apply the new one.
+ * Never throws.
+ */
+async function syncPreset(opts: {
+  agent: AgentView
+  source: 'created' | 'selected'
+  desired: string | undefined
+} & SyncDeps): Promise<void> {
+  const { agent, source, desired, log, getService, current } = opts
+  const agentId = String(agent.id ?? '?')
+  if (desired === undefined || desired.length === 0) {
+    log(`[preset-skills] sync build=${BUILD} agent=${agentId} source=${source} preset=<none> (no preset)`)
+
+    return
+  }
+  const record = current.get(agent as object)
+  if (record !== undefined && record.presetId === desired) {
+    log(`[preset-skills] sync build=${BUILD} agent=${agentId} source=${source} to=${desired} already-current`)
+    return
+  }
+
+  const seam = makeSeam(getService, agent, log)
+  const prepared = await preparePresetSkills(desired, seam)
+  if (prepared.state !== 'ok') {
+    log(
+      `[preset-skills] sync build=${BUILD} agent=${agentId} source=${source} to=${desired} `
+      + `state=${prepared.state} KEEP current=${record?.presetId ?? '<none>'}`,
+    )
+    return
+  }
+
+  // Dispose the previous set only after the new set is fully prepared.
+  let disposed = 0
+  if (record !== undefined) {
+    for (const disposer of record.disposers) {
+      try {
+        disposer()
+      } catch (error) {
+        log(`[preset-skills] sync dispose error agent=${agentId}: ${String(error)}`)
+      }
+      disposed += 1
+    }
+    current.delete(agent as object)
+  }
+
+  const applied = await applyPresetDefinitions(prepared, seam.register)
+  const from = record === undefined ? '<none>' : record.presetId
+  current.set(agent as object, { presetId: desired, disposers: applied.disposers })
+
+  log(
+    `[preset-skills] sync build=${BUILD} agent=${agentId} source=${source} from=${from} to=${desired} `
+    + `dir=${prepared.skillsDir ?? '<none>'} state=ok found=${prepared.found} disposed=${disposed} `
+    + `registered=${applied.registered}${applied.skipped.length > 0 ? ` skipped=[${applied.skipped.join('|')}]` : ''}`,
+  )
+}
+
+/** Resolve the preset an agent currently runs, with a session-header fallback. */
+function resolveComposedPreset(ctx: Context, agent: unknown, log: (line: string) => void): string | undefined {
+  const a = agent as AgentLike
+  try {
+    const agentPresets = readAgentPresets(ctx)
     if (agentPresets !== undefined) {
       try {
-        presetId = agentPresets.composedPreset(a.ctx)
-        if (presetId !== undefined && presetId.length > 0) presetSource = 'composed'
+        const presetId = agentPresets.composedPreset(a.ctx)
+        if (presetId !== undefined && presetId.length > 0) return presetId
       } catch (error) {
-        log(`[preset-skills] composedPreset threw agent=${id}: ${String(error)}`)
+        log(`[preset-skills] composedPreset threw agent=${String(a.id ?? '?')}: ${String(error)}`)
       }
     }
-    // Fallback: an agent announced without a composed preset may still declare
-    // one on its session header (e.g. some resume paths). Resolve that id.
-    if (presetId === undefined) {
-      const headerPreset = sessionHeaderPreset(agent)
-      if (headerPreset !== undefined) {
-        presetId = headerPreset
-        presetSource = 'header'
-      }
-    }
-
-    const seam: RegisterSeam = {
-      async resolveSkillsDir(preset) {
-        if (agentPresets === undefined) return undefined
-        const resolved = await agentPresets.resolve(preset)
-        if (resolved === undefined || resolved.path === undefined) return undefined
-        return join(dirname(resolved.path), 'skills')
-      },
-      discover: (dir) => discoverSkills(dir),
-      load: (skill) => loadSkill(skill),
-      register(registration) {
-        const target = registrationTarget(agentPresets, agent)
-        if (target === undefined) throw new Error('no skills service reachable from the agent context')
-        target.register(registration as never)
-      },
-      log,
-    }
-
-    const result = await registerPresetSkills(presetId, seam)
-    if (result.state === 'no-preset') {
-      log(
-        `[preset-skills] agent/created build=${BUILD} agent=${id} preset=<none> `
-        + `agentPresets=${agentPresets === undefined ? 'missing' : 'present'} source=${presetSource} delegated=${delegated}`,
-      )
-      return
-    }
-    log(
-      `[preset-skills] agent/created build=${BUILD} agent=${id} preset=${result.presetId} `
-      + `presetSource=${presetSource} agentPresets=${agentPresets === undefined ? 'missing' : 'present'} `
-      + `dir=${result.skillsDir ?? '<none>'} state=${result.state} found=${result.found} `
-      + `registered=${result.registered}${result.skipped.length > 0 ? ` skipped=[${result.skipped.join('|')}]` : ''}`,
-    )
-  } catch (error) {
-    log(`[preset-skills] ERROR agent/created agent=${id}: ${String(error)}`)
+  } catch {
+    // fall through to header
   }
+  return sessionHeaderPreset(agent)
+}
+
+function readAgentPresets(ctx: Context): AgentPresetsLike | undefined {
+  try {
+    return (ctx as unknown as { get(n: string): unknown }).get('agentPresets') as AgentPresetsLike | undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** The dsh seams backing prepare/apply for one live agent. */
+function makeSeam(
+  getService: <T>(name: string) => T | undefined,
+  agent: AgentView,
+  log: (line: string) => void,
+): RegisterSeam {
+  const agentPresets = readAgentPresetsFrom(getService)
+  return {
+    async resolveSkillsDir(preset) {
+      if (agentPresets === undefined) return undefined
+      const resolved = await agentPresets.resolve(preset)
+      if (resolved === undefined || resolved.path === undefined) return undefined
+      return join(dirname(resolved.path), 'skills')
+    },
+    discover: (dir) => discoverSkills(dir),
+    load: (skill) => loadSkill(skill),
+    register(definition: SkillRegistration): (() => void) | undefined {
+      const target = registrationTarget(agentPresets, agent)
+      if (target === undefined) throw new Error('no skills service reachable from the agent context')
+      const disposer = (target as SkillsLike).register(definition)
+      return typeof disposer === 'function' ? disposer as () => void : undefined
+    },
+    log,
+  }
+}
+
+function readAgentPresetsFrom(getService: <T>(name: string) => T | undefined): AgentPresetsLike | undefined {
+  return getService<AgentPresetsLike>('agentPresets')
 }
 
 /**
@@ -232,19 +382,24 @@ async function handleAgentCreated(
  * Both channels stay preset/agent-isolated; neither touches the host (global)
  * layer.
  */
-function registrationTarget(agentPresets: AgentPresetsLike | undefined, agent: unknown): SkillsLike | undefined {
-  const a = agent as AgentLike
+function registrationTarget(
+  agentPresets: AgentPresetsLike | undefined,
+  agent: AgentView,
+): { register(registration: unknown): unknown } | undefined {
   if (agentPresets !== undefined) {
     try {
-      const scoped = agentPresets.serviceFor({ ctx: a.ctx }, 'skills') as SkillsLike | undefined
+      const scoped = agentPresets.serviceFor({ ctx: agent.ctx as Context }, 'skills') as
+        | { register(registration: unknown): unknown }
+        | undefined
       if (scoped !== undefined) return scoped
     } catch {
       // Fall through to the agent-context channel.
     }
   }
   try {
-    const ctxRead = a.ctx as unknown as { get?(name: string): unknown }
-    return ctxRead.get?.('skills') as SkillsLike | undefined
+    const ctxRead = agent.ctx as unknown as { get?(name: string): unknown }
+    const skills = ctxRead.get?.('skills') as { register(registration: unknown): unknown } | undefined
+    return skills
   } catch {
     return undefined
   }
@@ -253,6 +408,10 @@ function registrationTarget(agentPresets: AgentPresetsLike | undefined, agent: u
 // ---------------------------------------------------------------------------
 // Minimal structural readers (best-effort, never throw).
 // ---------------------------------------------------------------------------
+
+function isAgentLike(value: unknown): value is AgentView {
+  return typeof value === 'object' && value !== null
+}
 
 function idOfAgent(agent: unknown): string {
   try {

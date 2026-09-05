@@ -1,19 +1,21 @@
 /**
- * smoke-register — exercise the preset-skill registration pipeline against the
+ * smoke-register — exercise the preset-skill prepare/apply pipeline against the
  * REAL preset skills directories with a mock (in-memory) registration sink.
  *
  * Verifies, without any dsh runtime:
- *   - registerPresetSkills discovers + registers research(20)/teacher(5)/developer(2);
+ *   - preparePresetSkills discovers + parses research(20)/teacher(5)/developer(2);
+ *   - applyPresetDefinitions registers definitions and returns disposers;
  *   - every emitted registration is a legal runtime skill definition
  *     (kebab name, description, invocation booleans, provider, source, content);
- *   - sinks are isolated per preset (the mock simulates one agent scope each —
- *     no cross-preset leakage possible at the pipeline level);
- *   - resolve/discover failures fold into results instead of throwing.
+ *   - sinks are isolated per preset (the mock simulates one agent scope each);
+ *   - resolve/discover failures fold into prepared results instead of throwing;
+ *   - v4.2 switch convergence: applying preset B after A disposes A's
+ *     disposers and leaves only B registered (one shared layer).
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { join } from 'node:path'
-import { registerPresetSkills, toRegistration } from '../lib/index.js'
+import { dirname, join } from 'node:path'
+import { preparePresetSkills, applyPresetDefinitions, toRegistration } from '../lib/index.js'
 import { parseSkillSource, isSkillName } from '../lib/index.js'
 
 const ROOT = process.env.DSH_HOME || 'C:/Users/fuqia/.dsh'
@@ -23,22 +25,32 @@ const PRESETS = [
   { id: 'developer', expect: 2 },
 ]
 
-/** Simulate one agent-scope sink: registrations land in this preset's bag. */
-function mockSink() {
-  const bag = []
+/** One simulated agent-scope skill layer: name → disposer, register/dispose ops. */
+function makeLayer() {
+  const entries = new Map()
+  const ops = []
   return {
-    bag,
+    entries,
+    ops,
     register(registration) {
-      bag.push(registration)
+      if (entries.has(registration.name)) throw new Error(`duplicate ${registration.name}`)
+      let live = true
+      entries.set(registration.name, registration)
+      ops.push(['register', registration.name])
+      return () => {
+        if (!live) return
+        live = false
+        entries.delete(registration.name)
+        ops.push(['dispose', registration.name])
+      }
     },
   }
 }
 
-function seamFor(presetId, sink, resolve) {
+function readSeam(log = () => {}) {
   return {
     async resolveSkillsDir(id) {
-      if (id !== presetId) throw new Error(`resolve called for unexpected preset ${id}`)
-      return resolve()
+      return join(ROOT, '.agent-presets', id, 'skills')
     },
     async discover(dir) {
       const { discoverSkills } = await import('../lib/index.js')
@@ -48,22 +60,24 @@ function seamFor(presetId, sink, resolve) {
       const { loadSkill } = await import('../lib/index.js')
       return await loadSkill(skill)
     },
-    register: sink.register,
-    log() {},
+    log,
   }
 }
 
 for (const { id, expect } of PRESETS) {
-  test(`register pipeline: preset ${id} registers ${expect} skills`, async () => {
-    const sink = mockSink()
-    const dir = join(ROOT, '.agent-presets', id, 'skills')
-    const result = await registerPresetSkills(id, seamFor(id, sink, () => dir))
-    assert.equal(result.state, 'ok', `state for ${id}`)
-    assert.equal(result.found, expect, `found ${id}`)
-    assert.equal(result.registered, expect, `registered ${id}`)
-    assert.equal(result.skipped.length, 0, `skipped ${id}: ${result.skipped.join(',')}`)
-    assert.equal(sink.bag.length, expect)
-    for (const reg of sink.bag) {
+  test(`prepare+apply: preset ${id} yields ${expect} registrations`, async () => {
+    const layer = makeLayer()
+    const seam = readSeam()
+    const prepared = await preparePresetSkills(id, seam)
+    assert.equal(prepared.state, 'ok', `state for ${id}`)
+    assert.equal(prepared.found, expect, `found ${id}`)
+    assert.equal(prepared.skipped.length, 0, `skipped ${id}: ${prepared.skipped.join(',')}`)
+    assert.equal(prepared.definitions.length, expect)
+    const applied = await applyPresetDefinitions(prepared, (def) => layer.register(def))
+    assert.equal(applied.registered, expect, `registered ${id}`)
+    assert.equal(applied.disposers.length, expect)
+    assert.equal(layer.entries.size, expect)
+    for (const reg of layer.entries.values()) {
       assert.ok(isSkillName(reg.name), `bad name ${reg.name}`)
       assert.ok(typeof reg.description === 'string' && reg.description.length > 0, `${reg.name} description`)
       assert.equal(typeof reg.invocation.modelInvocable, 'boolean', `${reg.name} modelInvocable`)
@@ -71,56 +85,57 @@ for (const { id, expect } of PRESETS) {
       assert.equal(reg.provider, 'dsh-preset-skills', `${reg.name} provider stamp`)
       assert.equal(reg.source, 'runtime', `${reg.name} source`)
       assert.equal(reg.resourceBase.kind, 'directory', `${reg.name} resourceBase kind`)
-      // Directory bundles resolve against their own directory; flat skills
-      // against the skills dir — either way: the file's parent directory.
-      const { dirname } = await import('node:path')
       assert.equal(reg.resourceBase.path, dirname(reg.path), `${reg.name} resourceBase path`)
       assert.ok(typeof reg.content === 'string', `${reg.name} content`)
-      assert.ok(reg.path.startsWith(dir), `${reg.name} path under skills dir`)
+      assert.ok(reg.path.startsWith(join(ROOT, '.agent-presets', id)), `${reg.name} path under preset`)
     }
   })
 }
 
-test('registration names across presets do not collide at pipeline level (per-scope sinks)', async () => {
-  // Each preset registers into its own sink; duplicate names across presets are
-  // legal (layers are per scope). Assert nothing leaks BETWEEN sinks by
-  // registering into one sink and checking a second stays empty.
-  const research = mockSink()
-  const teacher = mockSink()
-  const dirR = join(ROOT, '.agent-presets', 'research', 'skills')
-  const dirT = join(ROOT, '.agent-presets', 'teacher', 'skills')
-  await registerPresetSkills('research', seamFor('research', research, () => dirR))
-  await registerPresetSkills('teacher', seamFor('teacher', teacher, () => dirT))
-  assert.ok(research.bag.length > 0)
-  assert.ok(teacher.bag.length > 0)
-  // Sinks (one per agent scope) are independent: registering research into its
-  // own sink never wrote into teacher's, and vice versa.
-  assert.ok(research.bag.every((r) => r.path.includes(join('research', 'skills'))))
-  assert.ok(teacher.bag.every((r) => r.path.includes(join('teacher', 'skills'))))
+test('v4.2 switch convergence: B replaces A in one shared layer', async () => {
+  const layer = makeLayer()
+  const seam = readSeam()
+
+  // Agent created under research → apply research set.
+  const researchPrepared = await preparePresetSkills('research', seam)
+  const researchApplied = await applyPresetDefinitions(researchPrepared, (def) => layer.register(def))
+  assert.ok(researchApplied.registered === 20)
+  assert.ok([...layer.entries.keys()].includes('nature-writing'))
+
+  // Blank-session switch to teacher: prepare new set read-only…
+  const teacherPrepared = await preparePresetSkills('teacher', seam)
+  assert.ok(teacherPrepared.definitions.length === 5)
+  // …still research-only in the layer (nothing disposed before apply)…
+  assert.ok([...layer.entries.keys()].includes('nature-writing'))
+  assert.ok(![...layer.entries.keys()].includes('chaoxing-suite'))
+  // …dispose the old set…
+  for (const disposer of researchApplied.disposers) disposer()
+  assert.ok(layer.entries.size === 0)
+  // …then apply the new set.
+  const teacherApplied = await applyPresetDefinitions(teacherPrepared, (def) => layer.register(def))
+  assert.ok(teacherApplied.registered === 5)
+  const names = [...layer.entries.keys()]
+  assert.ok(names.includes('chaoxing-suite'))
+  assert.ok(!names.includes('nature-writing'), 'research names must be gone after switch')
+  assert.ok(layer.entries.size === 5)
+
+  // Disposers of the replaced set are single-shot: second call is a no-op.
+  assert.doesNotThrow(() => teacherApplied.disposers[0]())
 })
 
-test('unknown preset id resolves to a folded result (resolve-failed)', async () => {
-  const sink = mockSink()
-  const result = await registerPresetSkills('no-such-preset', {
+test('unknown preset id folds into a prepared resolve-failed result', async () => {
+  const prepared = await preparePresetSkills('no-such-preset', {
+    ...readSeam(),
     async resolveSkillsDir() {
       return undefined
     },
-    async discover() {
-      return []
-    },
-    async load() {
-      return undefined
-    },
-    register: sink.register,
-    log() {},
   })
-  assert.equal(result.state, 'resolve-failed')
-  assert.equal(result.registered, 0)
-  assert.equal(sink.bag.length, 0)
+  assert.equal(prepared.state, 'resolve-failed')
+  assert.equal(prepared.definitions.length, 0)
 })
 
 test('missing preset id yields no-preset result without touching anything', async () => {
-  const result = await registerPresetSkills(undefined, {
+  const prepared = await preparePresetSkills(undefined, {
     async resolveSkillsDir() {
       throw new Error('must not be called')
     },
@@ -130,10 +145,12 @@ test('missing preset id yields no-preset result without touching anything', asyn
     async load() {
       return undefined
     },
-    register() {},
+    register() {
+      return () => {}
+    },
     log() {},
   })
-  assert.equal(result.state, 'no-preset')
+  assert.equal(prepared.state, 'no-preset')
 })
 
 test('toRegistration maps a parsed skill fully', () => {

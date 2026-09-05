@@ -18,13 +18,16 @@
    - 兄弟预设永远看不到（standing 键不相交）；
    - 注册 effect 归 agent scope fiber 所有，agent 释放自动回收，无手动清理。
    - 若某预设的 standing 组合自己发布了 `skills` 服务，则优先走 `agentPresets.serviceFor(...)`（落 standing 层，同预设所有会话共享）；否则回退 agent ctx 通道。
+5. **v4.2 空白会话动态切预设**：dsh 的预设切换（`agent-presets select`→`swap`）在空白会话上把 agent scope 重链到新预设 standing，但**不会重触发 agent/created**。插件新增生产监听 `agent-preset/selected`（该事件在 recompose 提交后才由 agent-presets 发出），取出 live agent 后做**收敛式同步**：先只读 prepare 新预设技能 → 释放旧注册集的 disposers → 应用新注册集。所有 per-agent 工作走同一条串行队列，与 `agent/created` 注册不交错。语义与 dsh recompose 一致：换绑即换视角，旧预设技能立即清出该会话。
 
 Marker 主行示例（`build` 戳用于区分旧 build/残留进程）：
 
 ```
-[preset-skills] agent/created build=v4.1 agent=session-… preset=teacher presetSource=composed
+[preset-skills] agent/created build=v4.2 agent=session-… preset=teacher presetSource=composed
                 agentPresets=present dir=C:\Users\fuqia\.dsh\.agent-presets\teacher\skills
                 state=ok found=5 registered=5
+[preset-skills] sync build=v4.2 agent=session-… source=selected from=research to=teacher
+                dir=C:\Users\fuqia\.dsh\.agent-presets\teacher\skills state=ok found=5 disposed=20 registered=5
 ```
 
 ## 构建 / 测试 / 部署
@@ -69,7 +72,7 @@ cp lib/index.js lib/index.js.map lib/index.d.ts cordis.patch.yml \
 
 ## 已知边界
 
-- **只在“新会话/创建即预设”时注册**：dsh 允许在空白会话内动态切预设（`agent-preset/selected` → recompose），但 recompose **不会**重新触发 `agent/created`，因此已创建的 agent 不会为新预设补注册、也不会移除已注册的旧预设技能（实测：research 会话空白期切到 teacher 后仍只见 research 技能）。成功场景请始终“新建会话时选定预设”。若需要支持动态切换，后续可在 `session/event` firehose 筛 `agent-preset/selected` 后重注册（含清理策略）。
+- **动态切预设（v4.2 已支持，限空白会话）**：dsh 只允许在从未跑过模型回合的空白会话里切预设（`turnBoundary` 守卫）。切换后插件立即把该会话的注册收敛到新预设（释放旧集、应用新集）。已开始过对话的会话其预设被 dsh 锁定，无需也无法切换。若未来 dsh 允许会话中途换预设，需要新的收敛语义（含历史一致性设计）。
 - 子代理（delegation depth > 0）跳过注册（避免高频读盘）；子代理看不到父 agent 的 agentKey 层技能（如需请走 standing 层或另行扩展）。
 - marker 日志随每事件追加；`config.debug: true` 会额外记录候选事件探针（噪音较大），排查用。
 

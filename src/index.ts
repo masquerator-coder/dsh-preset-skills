@@ -83,7 +83,7 @@ export type { RegisterSeam, PreparedPreset, ApplyResult, SkillRegistration } fro
 export const name = 'dsh-preset-skills'
 
 /** Build stamp included in marker lines so experiments identify the running code. */
-const BUILD = 'v4.2'
+const BUILD = 'v4.2.1'
 
 /** Config accepted by the binder. */
 export interface Config {
@@ -140,6 +140,30 @@ export function apply(ctx: Context, config: Config = {}): void {
   const queues = new Map<string, Promise<void>>()
   const current = new WeakMap<object, RegistrationRecord>()
 
+  /**
+   * Memoized preset → skills-dir resolution. `agentPresets.resolve` triggers a
+   * full roster discovery (health checks over every preset composition) on
+   * EACH call, which is far slower than the client UI's one-shot catalog
+   * prewarm — enough to lose the race on a freshly created session (the UI
+   * caches the empty catalog until a preset switch invalidates it). Resolve
+   * once per preset per process so registration finishes before the prewarm.
+   */
+  const dirCache = new Map<string, Promise<string | undefined>>()
+  const resolveSkillsDirMemo = (agentPresets: AgentPresetsLike | undefined, preset: string): Promise<string | undefined> => {
+    if (agentPresets === undefined) return Promise.resolve(undefined)
+    let memo = dirCache.get(preset)
+    if (memo === undefined) {
+      memo = (async () => {
+        const resolved = await agentPresets.resolve(preset)
+        if (resolved === undefined || resolved.path === undefined) return undefined
+        return join(dirname(resolved.path), 'skills')
+      })()
+      memo.catch(() => { dirCache.delete(preset) })
+      dirCache.set(preset, memo)
+    }
+    return memo
+  }
+
   const enqueue = (agentId: string, task: () => Promise<void>): void => {
     const prev = queues.get(agentId) ?? Promise.resolve()
     const guard = prev.then(task, task).catch(() => undefined)
@@ -148,6 +172,10 @@ export function apply(ctx: Context, config: Config = {}): void {
       if (queues.get(agentId) === guard) queues.delete(agentId)
     })
   }
+
+  /** Roster-backed, memoized skills-dir lookup used by every seam. */
+  const resolveDir = (preset: string): Promise<string | undefined> =>
+    resolveSkillsDirMemo(getService<AgentPresetsLike>('agentPresets'), preset)
 
   // ---------------------------------------------------------------------------
   // MAIN HOOK: agent/created. Preset already composed; register its skills and
@@ -168,6 +196,7 @@ export function apply(ctx: Context, config: Config = {}): void {
         desired: resolveComposedPreset(ctx, agent, log),
         log,
         getService,
+        resolveDir,
         current,
       }))
     } catch (error) {
@@ -205,6 +234,7 @@ export function apply(ctx: Context, config: Config = {}): void {
         desired: preset,
         log,
         getService,
+        resolveDir,
         current,
       }))
     } catch (error) {
@@ -251,6 +281,7 @@ interface AgentView {
 interface SyncDeps {
   log: (line: string) => void
   getService: <T>(name: string) => T | undefined
+  resolveDir: (presetId: string) => Promise<string | undefined>
   current: WeakMap<object, RegistrationRecord>
 }
 
@@ -264,7 +295,7 @@ async function syncPreset(opts: {
   source: 'created' | 'selected'
   desired: string | undefined
 } & SyncDeps): Promise<void> {
-  const { agent, source, desired, log, getService, current } = opts
+  const { agent, source, desired, log, getService, resolveDir, current } = opts
   const agentId = String(agent.id ?? '?')
   if (desired === undefined || desired.length === 0) {
     log(`[preset-skills] sync build=${BUILD} agent=${agentId} source=${source} preset=<none> (no preset)`)
@@ -277,7 +308,7 @@ async function syncPreset(opts: {
     return
   }
 
-  const seam = makeSeam(getService, agent, log)
+  const seam = makeSeam(getService, agent, log, resolveDir)
   const prepared = await preparePresetSkills(desired, seam)
   if (prepared.state !== 'ok') {
     log(
@@ -344,15 +375,11 @@ function makeSeam(
   getService: <T>(name: string) => T | undefined,
   agent: AgentView,
   log: (line: string) => void,
+  resolveDir: (presetId: string) => Promise<string | undefined>,
 ): RegisterSeam {
-  const agentPresets = readAgentPresetsFrom(getService)
+  const agentPresets = getService<AgentPresetsLike>('agentPresets')
   return {
-    async resolveSkillsDir(preset) {
-      if (agentPresets === undefined) return undefined
-      const resolved = await agentPresets.resolve(preset)
-      if (resolved === undefined || resolved.path === undefined) return undefined
-      return join(dirname(resolved.path), 'skills')
-    },
+    resolveSkillsDir: resolveDir,
     discover: (dir) => discoverSkills(dir),
     load: (skill) => loadSkill(skill),
     register(definition: SkillRegistration): (() => void) | undefined {
@@ -363,10 +390,6 @@ function makeSeam(
     },
     log,
   }
-}
-
-function readAgentPresetsFrom(getService: <T>(name: string) => T | undefined): AgentPresetsLike | undefined {
-  return getService<AgentPresetsLike>('agentPresets')
 }
 
 /**

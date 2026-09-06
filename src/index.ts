@@ -47,6 +47,22 @@
  *   mirrors dsh's own recompose semantics (re-link = swap of the resolved
  *   view); the blank-session guard means no model turn observes the window.
  *
+ * v4.3 — startup roster prewarm (mitigation, not a cure):
+ *
+ *   dsh's web UI fires a scope-birth `skills/list` warm for each session and
+ *   caches the per-session catalog, re-pulling only on preset switch or
+ *   connection reset. dsh-api-session-controller whitelists events forwarded to
+ *   the browser (`API_REMOTE_FORWARDED_EVENTS`); notably `skills/change` is NOT
+ *   listed there, so the UI never learns that preset skills finished
+ *   registering. On a cold boot the first `agent/created` registration is slow
+ *   (first `agentPresets.resolve` → full roster discovery health-checks), so
+ *   the UI prewarm can win the race and pin an empty catalog until the user
+ *   switches once. v4.3 pre-fills `dirCache` from ONE `agentPresets.list()`
+ *   right after apply, making the first registration ~milliseconds so it beats
+ *   the prewarm in the common case. Strictly best-effort and bounded; the
+ *   correct-but-slow resolve path remains the fallback. Full fix belongs in dsh
+ *   (forward `skills/change`; subscribe it in ui-skill's catalog cache).
+ *
  * All services are resolved lazily INSIDE the event handlers (never cached at
  * `apply` time), so composition order cannot strand the plugin with a stale
  * `undefined` service handle.
@@ -83,7 +99,7 @@ export type { RegisterSeam, PreparedPreset, ApplyResult, SkillRegistration } fro
 export const name = 'dsh-preset-skills'
 
 /** Build stamp included in marker lines so experiments identify the running code. */
-const BUILD = 'v4.2.1'
+const BUILD = 'v4.3.0'
 
 /** Config accepted by the binder. */
 export interface Config {
@@ -176,6 +192,59 @@ export function apply(ctx: Context, config: Config = {}): void {
   /** Roster-backed, memoized skills-dir lookup used by every seam. */
   const resolveDir = (preset: string): Promise<string | undefined> =>
     resolveSkillsDirMemo(getService<AgentPresetsLike>('agentPresets'), preset)
+
+  // ---------------------------------------------------------------------------
+  // STARTUP ROSTER PREWARM (v4.3 — slows the startup race, not a cure):
+  //
+  // The web UI's scope-birth warm() fires a `skills/list` RPC the moment a
+  // session is created and caches the answer per session; it only re-pulls on
+  // a preset switch or connection reset. If the preset's runtime skills are
+  // registered AFTER that warm lands, the UI keeps a stale (pre-registration)
+  // catalog until the user switches once. The registration's wall time is
+  // dominated by the FIRST `agentPresets.resolve` → full `discoverPresets`
+  // (health-checks every preset composition), which on a cold boot can take
+  // seconds — far longer than the UI prewarm round trip.
+  //
+  // This prewarm runs ONE roster discovery up front (right after apply, while
+  // dsh is still assembling bundles/sessions) and uses the returned rows to
+  // pre-fill `dirCache` for every preset. The first `agent/created` then hits
+  // a warm cache and registers in ~ms instead of seconds, so it beats the UI
+  // prewarm in the common cold-boot case. It is strictly best-effort: if the
+  // roster is not yet servable it retries briefly, then gives up and the
+  // normal `resolveSkillsDirMemo` path (slow but correct) takes over.
+  // ---------------------------------------------------------------------------
+  {
+    const attemptPrewarm = (): boolean => {
+      const presets = getService<AgentPresetsLike>('agentPresets')
+      if (presets === undefined || typeof presets.list !== 'function') return false
+      void (async () => {
+        try {
+          const rows = await presets.list()
+          let filled = 0
+          for (const row of rows) {
+            if (typeof row?.id !== 'string' || typeof row?.path !== 'string') continue
+            if (dirCache.has(row.id)) continue
+            dirCache.set(row.id, Promise.resolve(join(dirname(row.path), 'skills')))
+            filled += 1
+          }
+          log(`[preset-skills] roster prewarm build=${BUILD} rows=${rows.length} dirs=${filled}`)
+        } catch (error) {
+          log(`[preset-skills] roster prewarm failed: ${String(error)}`)
+        }
+      })()
+      return true
+    }
+    if (!attemptPrewarm()) {
+      // Service not injected yet (early apply). Retry briefly on a timer;
+      // attempts run at most this many times before giving up gracefully.
+      let tries = 0
+      const timer = setInterval(() => {
+        tries += 1
+        if (attemptPrewarm() || tries >= 30) clearInterval(timer)
+      }, 200)
+      if (typeof timer.unref === 'function') timer.unref()
+    }
+  }
 
   // ---------------------------------------------------------------------------
   // MAIN HOOK: agent/created. Preset already composed; register its skills and

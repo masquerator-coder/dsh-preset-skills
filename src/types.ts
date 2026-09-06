@@ -20,6 +20,8 @@ export interface AgentPresetsLike {
   composedPreset(agentCtx: Context): string | undefined
   /** Resolve a preset id to its roster record (path = agent.cordis.yml). */
   resolve(id: string): Promise<{ id: string; path?: string } | undefined>
+  /** Every preset row in roster order; `path` = agent.cordis.yml, may be absent. */
+  list(): Promise<Array<{ id?: string; path?: string }>>
   /** The preset's own instance of a service (e.g. `skills`), if published. */
   serviceFor<K extends string>(agent: { ctx: Context }, name: K): unknown
 }
